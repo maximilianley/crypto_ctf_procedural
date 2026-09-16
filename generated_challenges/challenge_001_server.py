@@ -1,67 +1,170 @@
 import hashlib
 import os
+import random
 from Crypto.Util.number import bytes_to_long, getPrime, isPrime
 
-FLAG = b'FLAG{currywurst_23337}'
+FLAG = b'FLAG{currywurst_20793}'
+OTHER_CONSTANTS = ['v', 'w', 'y', 'z', 'aa']
+MESSAGES = ['Message 1: Give me the flag', 'Message 2: Give me the flag', 'Message 3: Give me the flag', 'Message 4: Give me the flag', 'Message 5: Give me the flag']
+
+FIELD_PRIME_BITS = 256
+
+def is_probable_prime(candidate, rng, rounds=16):
+    if candidate < 2:
+        return False
+    for small_prime in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31):
+        if candidate == small_prime:
+            return True
+        if candidate % small_prime == 0:
+            return False
+    d = candidate - 1
+    s = 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+    for _ in range(rounds):
+        a = rng.randrange(2, candidate - 1)
+        x = pow(a, d, candidate)
+        if x in (1, candidate - 1):
+            continue
+        for _ in range(s - 1):
+            x = pow(x, 2, candidate)
+            if x == candidate - 1:
+                break
+        else:
+            return False
+    return True
+
+def sample_prime_modulus(seed):
+    rng = random.Random(seed)
+    while True:
+        candidate = rng.getrandbits(FIELD_PRIME_BITS)
+        candidate |= 1 << (FIELD_PRIME_BITS - 1)
+        candidate |= 1
+        if is_probable_prime(candidate, rng):
+            return candidate
+
+def sample_prime_order_group(q, rng):
+    while True:
+        k = rng.getrandbits(768)
+        k |= 1 << 767
+        if k % 2 != 0:
+            k += 1
+        p = k * q + 1
+        if isPrime(p):
+            break
+    h = 2
+    while True:
+        g = pow(h, (p - 1) // q, p)
+        if g > 1:
+            return p, g
+        h += 1
+
+def sample_nonzero_mod_q(rng, q):
+    while True:
+        value = rng.randrange(1, q)
+        if value != 0:
+            return value
 
 class WeakDSAServer:
     def __init__(self):
         # Standard DSA group parameters
-        self.q = 103281319250449290292758803283979570664449675451722265551336778434617156465449
-        self.p = 127278856562137214612111581002510941163337900937174888243391013882732128026142209841071329010033195589332891265491896762587095154778135989644891507550687654564117317025767936350680344085651312901637408944418338118374069483644293385294217208507342580712407543491040660911096447165269336025245106808549386118323
-        self.g = 100759751363587042316253600739137827720537397217384356148078054142042563522656253914123050125144962068314387422165953965944984584344380353878138044028125254095666913913730710152764770198319508342495567595930565985874155539327992917137275513587264473945831363777219411209202376297592842250488718570205158266978
+        runtime_rng = random.Random(os.urandom(96))
+        self.group_q = sample_prime_modulus(os.urandom(96))
+        self.group_p, self.generator_g = sample_prime_order_group(self.group_q, runtime_rng)
 
         # Private key x, Public key y
-        self.x = bytes_to_long(FLAG)
-        self.y = 35472858201520214284560958496620987857884849045905784403358287504142054735928738471373072601708757441309153020848126725621137008578071445393132955752873109125832026872809311608671952805862472522019304683261304534297682918719507099599486347874976105568068402979648751352105760413680302198655184351700216829712
+        self.private_x = bytes_to_long(FLAG)
+        self.public_y = pow(self.generator_g, self.private_x, self.group_p)
 
         # Generated state terms
-        self.u = 88965406865504235407124998695370623222434713173366049810568670858819086251137
+        self.state_u = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.state_f = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.state_g = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.state_h = sample_nonzero_mod_q(runtime_rng, self.group_q)
 
         # Other constants
-        self.e = 77070004907068957796009361332510535107823304592922027302307107748441679590984
-        self.i = 62182974612516472447522241647091603859556375678245672312839216954796417854880
+        self.const_v = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.const_w = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.const_y = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.const_z = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.const_aa = sample_nonzero_mod_q(runtime_rng, self.group_q)
 
         self.current_k = 0
 
     def get_next_nonce(self):
-        """Vulnerable Nonce Generator using a generated recurrence."""
-        self.current_k = (((self.i + (self.e)*(self.u) + (self.i)*(self.u)) - ((self.u)*((self.u + self.u))))*pow(self.u, -1, self.q)) % self.q
-        self.u = self.current_k
+        self.current_k = (((self.const_aa*(((self.state_f + self.state_f + self.const_v*(self.const_v*(((-self.const_v + self.state_g) - self.state_f - self.state_u - (self.state_h + self.state_h + self.state_h + self.state_g)))) + self.state_h) - (((self.state_u - self.const_aa + self.state_f) + (-self.const_w + self.state_u + -self.const_v - self.state_g) + self.state_g))*(self.const_z*((self.state_f + self.state_u + self.const_z*((self.state_f - self.state_h + self.state_f)) - self.state_f))))) + self.const_z*(((self.const_w*((self.state_g + self.state_f + self.state_u)))*((self.state_g - -self.const_y - self.state_h - (self.state_u - self.state_f + self.state_h) - (self.state_g - self.state_h + self.state_g + -self.const_v))) + ((-self.const_z - self.state_h - (self.state_h - self.state_f) - self.state_g))**2 + (self.const_y*((self.state_g - self.state_u + -self.const_z + (self.state_g - self.state_f + -self.const_w))))**2)) + self.const_aa*((self.const_aa*((self.state_g + self.state_h - self.const_aa - ((self.state_g + self.state_h - self.const_aa) - self.state_h - self.state_u + self.state_f + -self.const_w))))*((self.state_f - self.const_w*((self.state_u - self.const_aa - self.state_h)) - (self.state_h - self.state_h + self.state_u - self.state_u))))) - (((self.state_u + -self.const_w - self.const_w*((self.const_z*((-self.const_z - self.state_h)) - self.state_h - self.state_h + (self.state_u - self.state_h + self.state_h + self.state_u)))))**2 + self.const_y*(((self.state_f)*(self.state_g) + ((self.state_g + (self.state_g - self.state_g + self.state_g) + -self.const_y))**2)) + (((self.state_h + self.state_u + self.state_u - self.state_u - self.state_g))**2 + ((self.state_u + self.state_g - self.state_f + self.const_aa - self.state_h))*((self.state_g + self.const_y*((self.state_f + -self.const_y)) + self.state_g - self.state_u))) - self.const_w + self.const_z*(((self.const_v*((self.state_h + (-self.const_w + self.state_g - -self.const_v + -self.const_v) - -self.const_v + -self.const_y)) + ((self.state_h - self.state_h + self.state_g - self.state_g) - -self.const_y - self.state_f + (self.state_h + -self.const_w + -self.const_z - self.state_u)) + self.state_f + self.state_u))*(((-self.const_z + self.state_f) + self.state_f + self.state_h - self.const_y*((-self.const_y - self.state_h + self.state_u)))))))*pow(self.state_f, -1, self.group_q)) % self.group_q
+        self.state_u = self.state_f
+        self.state_f = self.state_g
+        self.state_g = self.state_h
+        self.state_h = self.current_k
         return self.current_k
 
     def sign(self, message: bytes):
-        h = bytes_to_long(hashlib.sha256(message).digest()) % self.q
+        h = bytes_to_long(hashlib.sha256(message).digest()) % self.group_q
         k = self.get_next_nonce()
 
-        r = pow(self.g, k, self.p) % self.q
-        k_inv = pow(k, -1, self.q)
-        s = (k_inv * (h + self.x * r)) % self.q
+        r = pow(self.generator_g, k, self.group_p) % self.group_q
+        k_inv = pow(k, -1, self.group_q)
+        s = (k_inv * (h + self.private_x * r)) % self.group_q
         return (r, s)
 
 
-def main():
+def export_public_challenge():
     server = WeakDSAServer()
+    signatures = []
+    for message in MESSAGES:
+        signatures.append(server.sign(message.encode()))
+    return {
+        'p': server.group_p,
+        'q': server.group_q,
+        'g': server.generator_g,
+        'y': server.public_y,
+        'messages': list(MESSAGES),
+        'signatures': signatures,
+        'constants': {'v': server.const_v, 'w': server.const_w, 'y': server.const_y, 'z': server.const_z, 'aa': server.const_aa},
+    }
+
+def main():
+    challenge = export_public_challenge()
     print("=== Vulnerable DSA Signing Service ===")
-    print(f"p = {server.p}")
-    print(f"q = {server.q}")
-    print(f"g = {server.g}")
-    print(f"y = {server.y}")
+    print(f"p = {challenge['p']}")
+    print(f"q = {challenge['q']}")
+    print(f"g = {challenge['g']}")
+    print(f"y = {challenge['y']}")
     print()
     print("Other constants:")
-    print(f"  e = {server.e}")
-    print(f"  i = {server.i}")
+    print(f"  v = {challenge['constants']['v']}")
+    print(f"  w = {challenge['constants']['w']}")
+    print(f"  y = {challenge['constants']['y']}")
+    print(f"  z = {challenge['constants']['z']}")
+    print(f"  aa = {challenge['constants']['aa']}")
     print()
-    msg1 = b"Message 1: Give me the flag"
-    msg2 = b"Message 2: Give me the flag"
-    r1, s1 = server.sign(msg1)
-    r2, s2 = server.sign(msg2)
+    msg1 = challenge['messages'][0].encode()
+    msg2 = challenge['messages'][1].encode()
+    msg3 = challenge['messages'][2].encode()
+    msg4 = challenge['messages'][3].encode()
+    msg5 = challenge['messages'][4].encode()
+    r1, s1 = challenge['signatures'][0]
+    r2, s2 = challenge['signatures'][1]
+    r3, s3 = challenge['signatures'][2]
+    r4, s4 = challenge['signatures'][3]
+    r5, s5 = challenge['signatures'][4]
     print(f"Msg 1: {msg1.decode()}")
     print(f"r1 = {r1}")
     print(f"s1 = {s1}\n")
     print(f"Msg 2: {msg2.decode()}")
     print(f"r2 = {r2}")
     print(f"s2 = {s2}\n")
+    print(f"Msg 3: {msg3.decode()}")
+    print(f"r3 = {r3}")
+    print(f"s3 = {s3}\n")
+    print(f"Msg 4: {msg4.decode()}")
+    print(f"r4 = {r4}")
+    print(f"s4 = {s4}\n")
+    print(f"Msg 5: {msg5.decode()}")
+    print(f"r5 = {r5}")
+    print(f"s5 = {s5}\n")
 
 if __name__ == "__main__":
     main()

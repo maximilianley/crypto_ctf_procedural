@@ -11,35 +11,61 @@ from pprint import pformat
 
 from Crypto.Util.number import bytes_to_long, inverse, isPrime, long_to_bytes
 
-from generator import generate_formula, format_affine
+import generator as generator_module
+from generator import FIELD_PRIME_BITS, display_field_value, format_affine, generate_formula, is_probable_prime
 
 OUTPUT_DIR = Path(__file__).with_name("generated_challenges")
 CHALLENGE_COUNT = 3
 SEED_START = 789
-SEED_STRIDE = 1000003
+SEED_STRIDE = 1000004
+SAMPLED_GROUPS: dict[int, tuple[int, int]] = {}
+MODULUS_SYMBOL = "__QMOD__"
+RUNTIME_SEED_XOR = 0x5A5A5A5A
 
 GENERATOR_OPTIONS = {
-    "alias_count":                      2,
-    "extra_terms":                      0,
-    "complexity":                       "low",
-    "direct_alias_product_rate":        0.0,
-    "coefficient_rate":                 0.1,
+    "alias_count":                      5,
+    "extra_terms":                      4,
+    "complexity":                       "medium", # low medium high
+    "direct_alias_product_rate":        0.5,
+    "coefficient_rate":                 0.5,
     "raw_linear_terms_min":             1,
-    "raw_linear_terms_max":             1,
+    "raw_linear_terms_max":             5,
     "other_constants_min":              1,
-    "other_constants_max":              1,
-    "constant_min_appearances":         1,
+    "other_constants_max":              5,
+    "constant_min_appearances":         3,
     "constant_min_product_appearances": 1,
-    "inverse_rate":                     0.3,
+    "inverse_rate":                     0.45,
     "inverse_min_appearances":          1,
-    "inverse_min_product_appearances":  0,
+    "inverse_min_product_appearances":  6,
+    "free_x":                           False,
+    "linear_part_min":                  None,
+    "linear_part_max":                  None,
+    "leaf_part_min":                    None,
+    "leaf_part_max":                    None,
+    "nested_linear_rate":               None,
+    "nested_linear_scale_rate":         None,
+    "combo_scale_rate":                 None,
+    "compound_piece_rate":              None,
+    "compound_piece_min":               None,
+    "compound_piece_max":               None,
+    "quadratic_depth":                  None,
+    "core_depth":                       None,
+    "constant_atom_rate":               None,
+    "extra_constant_rate":              None,
     "mult_inverse":                     True,
 }
 
 
-def formal_to_data(formal: dict[tuple[str, ...], int]) -> list[dict[str, object]]:
+def smallest_modular_representative(value: int, modulus: int) -> int:
+    residue = value % modulus
+    if residue > modulus // 2:
+        return residue - modulus
+    return residue
+
+
+def formal_to_data(formal: dict[tuple[str, ...], int], modulus: int) -> list[dict[str, object]]:
     return [
-        {"monomial": list(monomial), "coefficient": coefficient}
+        {"monomial": list(monomial), "coefficient": smallest_modular_representative(coefficient, modulus)}
         for monomial, coefficient in sorted(formal.items())
     ]
 
@@ -71,11 +97,19 @@ def indent_block(lines: list[str], prefix: str) -> str:
     return "\n".join(f"{prefix}{line}" if line else "" for line in lines)
 
 
-def server_expr_from_rhs(rhs_text: str, state_aliases: list[str], constants: list[str], q_symbol: str) -> str:
-    expr = transform_visible_rhs_to_python(rhs_text, "__QMOD__")
-    for name in sorted(set(constants + state_aliases), key=len, reverse=True):
-        expr = re.sub(rf"\b{name}\b", f"self.{name}", expr)
-    expr = expr.replace("__QMOD__", q_symbol)
+def state_runtime_name(alias_name: str) -> str:
+    return f"state_{alias_name}"
+
+
+def constant_runtime_name(constant_name: str) -> str:
+    return f"const_{constant_name}"
+
+
+def server_expr_from_rhs(rhs_text: str, replacements: dict[str, str], q_symbol: str) -> str:
+    expr = transform_visible_rhs_to_python(rhs_text, MODULUS_SYMBOL)
+    for name, replacement in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+        expr = re.sub(rf"\b{re.escape(name)}\b", replacement, expr)
+    expr = expr.replace(MODULUS_SYMBOL, q_symbol)
     return expr
 
 
@@ -145,6 +179,9 @@ def solve_modular_quadratic(a: int, b: int, c: int, q: int) -> list[int]:
 
 
 def sample_prime_order_group(q: int, rng: random.Random) -> tuple[int, int]:
+    if q in SAMPLED_GROUPS:
+        return SAMPLED_GROUPS[q]
+
     while True:
         k = rng.getrandbits(768)
         k |= 1 << 767
@@ -158,8 +195,97 @@ def sample_prime_order_group(q: int, rng: random.Random) -> tuple[int, int]:
     while True:
         g = pow(h, (p - 1) // q, p)
         if g > 1:
+            SAMPLED_GROUPS[q] = (p, g)
             return p, g
         h += 1
+
+
+def sample_prime_modulus_for_seed(seed: int) -> int:
+    rng = random.Random(seed)
+    while True:
+        candidate = rng.getrandbits(FIELD_PRIME_BITS)
+        candidate |= 1 << (FIELD_PRIME_BITS - 1)
+        candidate |= 1
+        if is_probable_prime(candidate, rng):
+            return candidate
+
+
+def build_runtime_challenge(
+    bundle,
+    runtime_seed: int,
+    flag_suffix: int,
+    module_name: str,
+    rhs_text: str,
+) -> tuple[dict[str, object], bytes]:
+    q = sample_prime_modulus_for_seed(runtime_seed)
+    rng = random.Random(runtime_seed ^ RUNTIME_SEED_XOR)
+    constants = {
+        name: sample_nonzero_mod_q(rng, q)
+        for name in bundle.other_constants
+    }
+    messages = [f"Message {{i}}: Give me the flag".format(i=i) for i in range(1, len(bundle.affine_terms) + 1)]
+    seed_nonces = [sample_nonzero_mod_q(rng, q) for _ in range(len(bundle.affine_terms) - 1)]
+    flag = f"FLAG{{currywurst_{flag_suffix}}}".encode()
+    private_x = bytes_to_long(flag)
+    if private_x >= q:
+        raise ValueError("Flag is too large for sampled subgroup order")
+
+    p, g = sample_prime_order_group(q, rng)
+    y = pow(g, private_x, p)
+
+    rhs_expr = transform_visible_rhs_to_python(rhs_text, MODULUS_SYMBOL)
+    alias_names = [term.name for term in bundle.affine_terms]
+    state = dict(zip(alias_names[:-1], seed_nonces))
+    local_env = {**constants, **state, MODULUS_SYMBOL: q, "pow": pow}
+    recurring_nonce = eval(rhs_expr, {}, local_env) % q
+    if recurring_nonce == 0:
+        raise ValueError("Runtime recurrence produced zero nonce")
+
+    nonces = seed_nonces + [recurring_nonce]
+    signatures = compute_signatures([message.encode() for message in messages], nonces, p, q, g, private_x)
+
+    quadratic = quadratic_difference(bundle.lhs_quadratic, bundle.rhs_quadratic)
+    challenge = {
+        "name": module_name,
+        "seed": runtime_seed,
+        "flag_suffix": flag_suffix,
+        "p": p,
+        "q": q,
+        "g": g,
+        "y": y,
+        "messages": messages,
+        "signatures": signatures,
+        "constants": constants,
+        "other_constants": bundle.other_constants,
+        "inverse_sources": [term.source for term in bundle.inverse_terms],
+        "inverse_term_displays": [term.display for term in bundle.inverse_terms],
+        "affine_definitions": [
+            f"{term.name}(x) = {format_affine(term.intercept, term.slope)}"
+            for term in bundle.affine_terms
+        ],
+        "affine_terms": [
+            {
+                "alias_name": term.name,
+                "intercept_name": term.intercept.name,
+                "intercept_sign": sign_of_scalar(term.intercept.value),
+                "slope_name": term.slope.name,
+                "slope_sign": sign_of_scalar(term.slope.value),
+            }
+            for term in bundle.affine_terms
+        ],
+        "equation": bundle.equation,
+        "multilinear_equation": bundle.multilinear_equation,
+        "quadratic_form": bundle.quadratic_form,
+        "quadratic_terms": {
+            "constant": formal_to_data(quadratic[0], q),
+            "linear": formal_to_data(quadratic[1], q),
+            "square": formal_to_data(quadratic[2], q),
+        },
+        "seed_nonces": seed_nonces,
+        "withheld_alias_name": bundle.withheld_alias_name,
+        "mult_inverse_alias_name": bundle.mult_inverse_alias_name,
+    }
+    return challenge, flag
 
 
 def transform_visible_rhs_to_python(rhs_text: str, q_symbol: str) -> str:
@@ -185,7 +311,7 @@ def has_free_x(expr_text: str) -> bool:
 
 
 def sign_of_scalar(value: int) -> int:
-    return -1 if value < 0 else 1
+    return -1 if display_field_value(value) < 0 else 1
 
 
 def sample_nonzero_mod_q(rng: random.Random, q: int) -> int:
@@ -253,17 +379,22 @@ def verify_instance(challenge: dict[str, object], flag: bytes) -> None:
         raise ValueError("Recovered bytes do not match the embedded flag")
 
 
-def render_server_file(module_name: str, challenge: dict[str, object], flag: bytes, rhs_expr: str) -> str:
-    constants = list(challenge["constants"].items())
+def render_server_file(module_name: str, challenge: dict[str, object], flag: bytes, rhs_text: str) -> str:
+    constants = list(challenge["constants"].keys())
     state_terms = challenge["affine_terms"][:-1]
     state_aliases = [term["alias_name"] for term in state_terms]
     messages = challenge["messages"]
-    seed_nonces = challenge["seed_nonces"]
-    recurrence_expr = server_expr_from_rhs(rhs_expr, state_aliases, [name for name, _ in constants], "self.q")
+    state_attrs = {alias: state_runtime_name(alias) for alias in state_aliases}
+    constant_attrs = {name: constant_runtime_name(name) for name in constants}
+    replacements = {
+        **{alias: f"self.{attr_name}" for alias, attr_name in state_attrs.items()},
+        **{name: f"self.{attr_name}" for name, attr_name in constant_attrs.items()},
+    }
+    recurrence_expr = server_expr_from_rhs(rhs_text, replacements, "self.group_q")
 
-    state_setup = [f"        self.{alias} = {seed_nonces[index]}" for index, alias in enumerate(state_aliases)]
-    constant_setup = [f"        self.{name} = {value}" for name, value in constants]
-    constant_prints = [f'    print(f"  {name} = {{server.{name}}}")' for name, _ in constants]
+    state_setup = [f"        self.{state_attrs[alias]} = sample_nonzero_mod_q(runtime_rng, self.group_q)" for alias in state_aliases]
+    constant_setup = [f"        self.{constant_attrs[name]} = sample_nonzero_mod_q(runtime_rng, self.group_q)" for name in constants]
+    constant_prints = [f'    print(f"  {name} = {{challenge[\'constants\'][{name!r}]}}")' for name in constants]
     message_defs = [f'    msg{index} = b"{message}"' for index, message in enumerate(messages, start=1)]
     signature_assignments = [f'    r{index}, s{index} = server.sign(msg{index})' for index in range(1, len(messages) + 1)]
     signature_prints = []
@@ -275,20 +406,82 @@ def render_server_file(module_name: str, challenge: dict[str, object], flag: byt
     return "\n".join([
         "import hashlib",
         "import os",
+        "import random",
         "from Crypto.Util.number import bytes_to_long, getPrime, isPrime",
         "",
         f"FLAG = {flag!r}",
+        f"OTHER_CONSTANTS = {constants!r}",
+        f"MESSAGES = {messages!r}",
+        "",
+        "FIELD_PRIME_BITS = 256",
+        "",
+        "def is_probable_prime(candidate, rng, rounds=16):",
+        "    if candidate < 2:",
+        "        return False",
+        "    for small_prime in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31):",
+        "        if candidate == small_prime:",
+        "            return True",
+        "        if candidate % small_prime == 0:",
+        "            return False",
+        "    d = candidate - 1",
+        "    s = 0",
+        "    while d % 2 == 0:",
+        "        d //= 2",
+        "        s += 1",
+        "    for _ in range(rounds):",
+        "        a = rng.randrange(2, candidate - 1)",
+        "        x = pow(a, d, candidate)",
+        "        if x in (1, candidate - 1):",
+        "            continue",
+        "        for _ in range(s - 1):",
+        "            x = pow(x, 2, candidate)",
+        "            if x == candidate - 1:",
+        "                break",
+        "        else:",
+        "            return False",
+        "    return True",
+        "",
+        "def sample_prime_modulus(seed):",
+        "    rng = random.Random(seed)",
+        "    while True:",
+        "        candidate = rng.getrandbits(FIELD_PRIME_BITS)",
+        "        candidate |= 1 << (FIELD_PRIME_BITS - 1)",
+        "        candidate |= 1",
+        "        if is_probable_prime(candidate, rng):",
+        "            return candidate",
+        "",
+        "def sample_prime_order_group(q, rng):",
+        "    while True:",
+        "        k = rng.getrandbits(768)",
+        "        k |= 1 << 767",
+        "        if k % 2 != 0:",
+        "            k += 1",
+        "        p = k * q + 1",
+        "        if isPrime(p):",
+        "            break",
+        "    h = 2",
+        "    while True:",
+        "        g = pow(h, (p - 1) // q, p)",
+        "        if g > 1:",
+        "            return p, g",
+        "        h += 1",
+        "",
+        "def sample_nonzero_mod_q(rng, q):",
+        "    while True:",
+        "        value = rng.randrange(1, q)",
+        "        if value != 0:",
+        "            return value",
         "",
         "class WeakDSAServer:",
         "    def __init__(self):",
         "        # Standard DSA group parameters",
-        f"        self.q = {challenge['q']}",
-        f"        self.p = {challenge['p']}",
-        f"        self.g = {challenge['g']}",
+        "        runtime_rng = random.Random(os.urandom(96))",
+        "        self.group_q = sample_prime_modulus(os.urandom(96))",
+        "        self.group_p, self.generator_g = sample_prime_order_group(self.group_q, runtime_rng)",
         "",
         "        # Private key x, Public key y",
-        "        self.x = bytes_to_long(FLAG)",
-        f"        self.y = {challenge['y']}",
+        "        self.private_x = bytes_to_long(FLAG)",
+        "        self.public_y = pow(self.generator_g, self.private_x, self.group_p)",
         "",
         "        # Generated state terms",
         *state_setup,
@@ -299,35 +492,49 @@ def render_server_file(module_name: str, challenge: dict[str, object], flag: byt
         "        self.current_k = 0",
         "",
         "    def get_next_nonce(self):",
-        "        \"\"\"Vulnerable Nonce Generator using a generated recurrence.\"\"\"",
-        f"        self.current_k = ({recurrence_expr}) % self.q",
-        *[f"        self.{state_aliases[i]} = self.{state_aliases[i + 1]}" for i in range(len(state_aliases) - 1)],
-        f"        self.{state_aliases[-1]} = self.current_k",
+        f"        self.current_k = ({recurrence_expr}) % self.group_q",
+        *[f"        self.{state_attrs[state_aliases[i]]} = self.{state_attrs[state_aliases[i + 1]]}" for i in range(len(state_aliases) - 1)],
+        f"        self.{state_attrs[state_aliases[-1]]} = self.current_k",
         "        return self.current_k",
         "",
         "    def sign(self, message: bytes):",
-        "        h = bytes_to_long(hashlib.sha256(message).digest()) % self.q",
+        "        h = bytes_to_long(hashlib.sha256(message).digest()) % self.group_q",
         "        k = self.get_next_nonce()",
         "",
-        "        r = pow(self.g, k, self.p) % self.q",
-        "        k_inv = pow(k, -1, self.q)",
-        "        s = (k_inv * (h + self.x * r)) % self.q",
+        "        r = pow(self.generator_g, k, self.group_p) % self.group_q",
+        "        k_inv = pow(k, -1, self.group_q)",
+        "        s = (k_inv * (h + self.private_x * r)) % self.group_q",
         "        return (r, s)",
         "",
         "",
-        "def main():",
+        "def export_public_challenge():",
         "    server = WeakDSAServer()",
+        "    signatures = []",
+        "    for message in MESSAGES:",
+        "        signatures.append(server.sign(message.encode()))",
+        "    return {",
+        "        'p': server.group_p,",
+        "        'q': server.group_q,",
+        "        'g': server.generator_g,",
+        "        'y': server.public_y,",
+        "        'messages': list(MESSAGES),",
+        "        'signatures': signatures,",
+        f"        'constants': {{{', '.join(f'{name!r}: server.{constant_attrs[name]}' for name in constants)}}},",
+        "    }",
+        "",
+        "def main():",
+        "    challenge = export_public_challenge()",
         "    print(\"=== Vulnerable DSA Signing Service ===\")",
-        "    print(f\"p = {server.p}\")",
-        "    print(f\"q = {server.q}\")",
-        "    print(f\"g = {server.g}\")",
-        "    print(f\"y = {server.y}\")",
+        "    print(f\"p = {challenge['p']}\")",
+        "    print(f\"q = {challenge['q']}\")",
+        "    print(f\"g = {challenge['g']}\")",
+        "    print(f\"y = {challenge['y']}\")",
         "    print()",
         "    print(\"Other constants:\")",
         *constant_prints,
         "    print()",
-        *message_defs,
-        *signature_assignments,
+        *[f"    msg{index} = challenge['messages'][{index - 1}].encode()" for index in range(1, len(messages) + 1)],
+        *[f"    r{index}, s{index} = challenge['signatures'][{index - 1}]" for index in range(1, len(messages) + 1)],
         *signature_prints,
         "",
         "if __name__ == \"__main__\":",
@@ -336,31 +543,30 @@ def render_server_file(module_name: str, challenge: dict[str, object], flag: byt
 
 
 def render_solution_file(module_name: str, challenge: dict[str, object]) -> str:
-    message_count = len(challenge["messages"])
-    constant_lines = [f"{name} = {value}" for name, value in challenge["constants"].items()]
-    msg_lines = [f"msg{index} = b\"{message}\"" for index, message in enumerate(challenge["messages"], start=1)]
-    r_lines = [f"r{index} = {signature[0]}" for index, signature in enumerate(challenge["signatures"], start=1)]
-    s_lines = [f"s{index} = {signature[1]}" for index, signature in enumerate(challenge["signatures"], start=1)]
-    msg_list = ", ".join(f"msg{index}" for index in range(1, len(challenge["messages"]) + 1))
-    r_list = ", ".join(f"r{index}" for index in range(1, len(challenge["messages"]) + 1))
-    s_list = ", ".join(f"s{index}" for index in range(1, len(challenge["messages"]) + 1))
+    affine_env_assignments: list[str] = []
+    for index, term_info in enumerate(challenge["affine_terms"]):
+        affine_env_assignments.append(
+            f"env['{term_info['intercept_name']}'] = ({term_info['intercept_sign']} * w[{index}]) % q"
+        )
+        affine_env_assignments.append(
+            f"env['{term_info['slope_name']}'] = ({term_info['slope_sign']} * v[{index}]) % q"
+        )
+
     return "\n".join([
+        "import hashlib",
+        "",
         "from Crypto.Util.number import long_to_bytes, inverse",
         "",
-        f"p = {challenge['p']}",
-        f"q = {challenge['q']}",
-        f"g = {challenge['g']}",
-        f"y = {challenge['y']}",
-        *constant_lines,
+        f"import {module_name}_server as challenge_server",
         "",
-        *msg_lines,
-        *r_lines,
-        *s_lines,
-        "",
-        "import hashlib",
-        f"msgs=[{msg_list}]",
-        f"rs=[{r_list}]",
-        f"ss=[{s_list}]",
+        "public = challenge_server.export_public_challenge()",
+        "p = public['p']",
+        "q = public['q']",
+        "g = public['g']",
+        "y = public['y']",
+        "msgs = [message.encode() for message in public['messages']]",
+        "rs = [signature[0] for signature in public['signatures']]",
+        "ss = [signature[1] for signature in public['signatures']]",
         "hs=[int.from_bytes(hashlib.sha256(m).digest(),'big')%q for m in msgs]",
         "",
         "def tonelli(n,p):",
@@ -382,8 +588,8 @@ def render_solution_file(module_name: str, challenge: dict[str, object]) -> str:
         "        m=i; c=(b*b)%p; t=(t*c)%p; r=(r*b)%p",
         "    return r",
         "",
-        f"w=[(hs[i]*inverse(ss[i],q))%q for i in range({message_count})]",
-        f"v=[(rs[i]*inverse(ss[i],q))%q for i in range({message_count})]",
+        "w=[(hs[i]*inverse(ss[i],q))%q for i in range(len(msgs))]",
+        "v=[(rs[i]*inverse(ss[i],q))%q for i in range(len(msgs))]",
         "",
         "def eval_formal_data(terms, env, q):",
         "    total = 0",
@@ -409,15 +615,9 @@ def render_solution_file(module_name: str, challenge: dict[str, object]) -> str:
         "    inv2a = inverse((2 * a) % q, q)",
         "    return [((-b + sqrtD) * inv2a) % q, ((-b - sqrtD) * inv2a) % q]",
         "",
-        f"env = {{name: value % q for name, value in {{ {', '.join(f'{repr(name)}: {value}' for name, value in challenge['constants'].items())} }}.items()}}",
+        "env = {name: value % q for name, value in public['constants'].items()}",
         *[f"env['inv({source})'] = pow(env['{source}'], -1, q)" for source in challenge["inverse_sources"]],
-        f"for term_info, message, signature in zip({challenge['affine_terms']!r}, msgs, zip(rs, ss)):",
-        "    r, s = signature",
-        "    inv_s = inverse(s, q)",
-        "    w = (int.from_bytes(hashlib.sha256(message).digest(), 'big') * inv_s) % q",
-        "    v = (r * inv_s) % q",
-        "    env[term_info['intercept_name']] = (term_info['intercept_sign'] * w) % q",
-        "    env[term_info['slope_name']] = (term_info['slope_sign'] * v) % q",
+        *affine_env_assignments,
         "",
         f"a = eval_formal_data({challenge['quadratic_terms']['square']!r}, env, q)",
         f"b = eval_formal_data({challenge['quadratic_terms']['linear']!r}, env, q)",
@@ -432,103 +632,27 @@ def render_solution_file(module_name: str, challenge: dict[str, object]) -> str:
 
 
 def build_challenge_instance(index: int, seed: int) -> tuple[str, dict[str, object], bytes, str]:
-    rng = random.Random(seed ^ 0x5A5A5A5A)
     module_name = f"challenge_{index:03d}"
 
     while True:
+        generator_module.SAMPLED_FIELD_MODULUS = None
         bundle = generate_formula(seed=seed, **GENERATOR_OPTIONS)
         lhs_text, rhs_text = bundle.equation.split(" = ", 1)
         if has_free_x(rhs_text):
             seed += 1
-            rng.seed(seed ^ 0x5A5A5A5A)
             continue
 
-        q = bundle.modulus
-        constants = {
-            name: sample_nonzero_mod_q(rng, q)
-            for name in bundle.other_constants
-        }
-        messages = [f"Message {{i}}: Give me the flag".format(i=i) for i in range(1, len(bundle.affine_terms) + 1)]
-        seed_nonces = [sample_nonzero_mod_q(rng, q) for _ in range(len(bundle.affine_terms) - 1)]
-        flag = f"FLAG{{currywurst_{rng.randrange(10000, 100000)}}}".encode()
-        private_x = bytes_to_long(flag)
-        if private_x >= q:
-            seed += 1
-            rng.seed(seed ^ 0x5A5A5A5A)
-            continue
-
-        p, g = sample_prime_order_group(q, rng)
-        y = pow(g, private_x, p)
-
-        rhs_expr = transform_visible_rhs_to_python(rhs_text, "q")
-        alias_names = [term.name for term in bundle.affine_terms]
-        state = dict(zip(alias_names[:-1], seed_nonces))
-        local_env = {**constants, **state, "q": q, "pow": pow}
+        flag_suffix = 10000 + (seed % 90000)
         try:
-            recurring_nonce = eval(rhs_expr, {}, local_env) % q
+            challenge, flag = build_runtime_challenge(bundle, seed, flag_suffix, module_name, rhs_text)
         except ValueError:
             seed += 1
-            rng.seed(seed ^ 0x5A5A5A5A)
             continue
-
-        if recurring_nonce == 0:
-            seed += 1
-            rng.seed(seed ^ 0x5A5A5A5A)
-            continue
-
-        nonces = seed_nonces + [recurring_nonce]
-        try:
-            signatures = compute_signatures([message.encode() for message in messages], nonces, p, q, g, private_x)
-        except ValueError:
-            seed += 1
-            rng.seed(seed ^ 0x5A5A5A5A)
-            continue
-
-        quadratic = quadratic_difference(bundle.lhs_quadratic, bundle.rhs_quadratic)
-        challenge = {
-            "name": module_name,
-            "p": p,
-            "q": q,
-            "g": g,
-            "y": y,
-            "messages": messages,
-            "signatures": signatures,
-            "constants": constants,
-            "other_constants": bundle.other_constants,
-            "inverse_sources": [term.source for term in bundle.inverse_terms],
-            "inverse_term_displays": [term.display for term in bundle.inverse_terms],
-            "affine_definitions": [
-                f"{term.name}(x) = {format_affine(term.intercept, term.slope)}"
-                for term in bundle.affine_terms
-            ],
-            "affine_terms": [
-                {
-                    "alias_name": term.name,
-                    "intercept_name": term.intercept.name,
-                    "intercept_sign": sign_of_scalar(term.intercept.value),
-                    "slope_name": term.slope.name,
-                    "slope_sign": sign_of_scalar(term.slope.value),
-                }
-                for term in bundle.affine_terms
-            ],
-            "equation": bundle.equation,
-            "multilinear_equation": bundle.multilinear_equation,
-            "quadratic_form": bundle.quadratic_form,
-            "quadratic_terms": {
-                "constant": formal_to_data(quadratic[0]),
-                "linear": formal_to_data(quadratic[1]),
-                "square": formal_to_data(quadratic[2]),
-            },
-            "seed_nonces": seed_nonces,
-            "withheld_alias_name": bundle.withheld_alias_name,
-            "mult_inverse_alias_name": bundle.mult_inverse_alias_name,
-        }
 
         try:
             verify_instance(challenge, flag)
         except ValueError:
             seed += 1
-            rng.seed(seed ^ 0x5A5A5A5A)
             continue
 
         return module_name, challenge, flag, rhs_text
@@ -548,7 +672,7 @@ def main() -> None:
         module_name, challenge, flag, rhs_text = build_challenge_instance(index, challenge_seed)
         server_path = OUTPUT_DIR / f"{module_name}_server.py"
         solution_path = OUTPUT_DIR / f"{module_name}_solution.py"
-        write_text(server_path, render_server_file(module_name, challenge, flag, transform_visible_rhs_to_python(rhs_text, "self.q")))
+        write_text(server_path, render_server_file(module_name, challenge, flag, rhs_text))
         write_text(solution_path, render_solution_file(module_name, challenge))
         generated.append((server_path, solution_path, challenge["equation"]))
 

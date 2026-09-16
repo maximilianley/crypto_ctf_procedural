@@ -16,6 +16,7 @@ FUNCTION_NAMES = ("u", "f", "g", "h", "p", "q", "r", "s", "t", "m", "n")
 FIELD_PRIME_BITS = 256
 FIELD_MODULUS = 0
 OTHER_CONSTANTS_MAX: int | None = None
+SAMPLED_FIELD_MODULUS: int | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,50 @@ COMPLEXITY_PRESETS: dict[str, ComplexityProfile] = {
 		extra_constant_rate=0.12,
 	),
 }
+
+
+def resolve_complexity_profile(
+	complexity: str,
+	*,
+	linear_part_min: int | None = None,
+	linear_part_max: int | None = None,
+	leaf_part_min: int | None = None,
+	leaf_part_max: int | None = None,
+	nested_linear_rate: float | None = None,
+	nested_linear_scale_rate: float | None = None,
+	combo_scale_rate: float | None = None,
+	compound_piece_rate: float | None = None,
+	compound_piece_min: int | None = None,
+	compound_piece_max: int | None = None,
+	quadratic_depth: int | None = None,
+	core_depth: int | None = None,
+	constant_atom_rate: float | None = None,
+	extra_constant_rate: float | None = None,
+) -> ComplexityProfile:
+	base = COMPLEXITY_PRESETS.get(complexity, COMPLEXITY_PRESETS["medium"])
+	resolved_linear_part_min = max(1, base.linear_part_range[0] if linear_part_min is None else linear_part_min)
+	resolved_linear_part_max = max(resolved_linear_part_min, base.linear_part_range[1] if linear_part_max is None else linear_part_max)
+	resolved_leaf_part_min = max(1, base.leaf_part_range[0] if leaf_part_min is None else leaf_part_min)
+	resolved_leaf_part_max = max(resolved_leaf_part_min, base.leaf_part_range[1] if leaf_part_max is None else leaf_part_max)
+	resolved_compound_piece_min = max(1, base.compound_piece_range[0] if compound_piece_min is None else compound_piece_min)
+	resolved_compound_piece_max = max(resolved_compound_piece_min, base.compound_piece_range[1] if compound_piece_max is None else compound_piece_max)
+
+	def resolve_rate(value: float | None, default: float) -> float:
+		return min(max(default if value is None else value, 0.0), 1.0)
+
+	return ComplexityProfile(
+		linear_part_range=(resolved_linear_part_min, resolved_linear_part_max),
+		leaf_part_range=(resolved_leaf_part_min, resolved_leaf_part_max),
+		nested_linear_rate=resolve_rate(nested_linear_rate, base.nested_linear_rate),
+		nested_linear_scale_rate=resolve_rate(nested_linear_scale_rate, base.nested_linear_scale_rate),
+		combo_scale_rate=resolve_rate(combo_scale_rate, base.combo_scale_rate),
+		compound_piece_rate=resolve_rate(compound_piece_rate, base.compound_piece_rate),
+		compound_piece_range=(resolved_compound_piece_min, resolved_compound_piece_max),
+		quadratic_depth=max(0, base.quadratic_depth if quadratic_depth is None else quadratic_depth),
+		core_depth=max(0, base.core_depth if core_depth is None else core_depth),
+		constant_atom_rate=resolve_rate(constant_atom_rate, base.constant_atom_rate),
+		extra_constant_rate=resolve_rate(extra_constant_rate, base.extra_constant_rate),
+	)
 
 
 def add_coeffs(left: CoeffTriple, right: CoeffTriple) -> CoeffTriple:
@@ -416,11 +461,15 @@ def is_probable_prime(candidate: int, rng: random.Random, rounds: int = 16) -> b
 
 
 def sample_prime_modulus(rng: random.Random) -> int:
+	global SAMPLED_FIELD_MODULUS
+	if SAMPLED_FIELD_MODULUS is not None:
+		return SAMPLED_FIELD_MODULUS
 	while True:
 		candidate = rng.getrandbits(FIELD_PRIME_BITS)
 		candidate |= 1 << (FIELD_PRIME_BITS - 1)
 		candidate |= 1
 		if is_probable_prime(candidate, rng):
+			SAMPLED_FIELD_MODULUS = candidate
 			return candidate
 
 
@@ -1125,6 +1174,21 @@ def generate_formula(
 	inverse_min_appearances: int = 2,
 	inverse_min_product_appearances: int = 1,
 	mult_inverse: bool = False,
+	free_x: bool = True,
+	linear_part_min: int | None = None,
+	linear_part_max: int | None = None,
+	leaf_part_min: int | None = None,
+	leaf_part_max: int | None = None,
+	nested_linear_rate: float | None = None,
+	nested_linear_scale_rate: float | None = None,
+	combo_scale_rate: float | None = None,
+	compound_piece_rate: float | None = None,
+	compound_piece_min: int | None = None,
+	compound_piece_max: int | None = None,
+	quadratic_depth: int | None = None,
+	core_depth: int | None = None,
+	constant_atom_rate: float | None = None,
+	extra_constant_rate: float | None = None,
 ) -> FormulaBundle:
 	rng = random.Random(seed)
 	modulus = sample_prime_modulus(rng)
@@ -1132,8 +1196,12 @@ def generate_formula(
 	global OTHER_CONSTANTS_MAX
 	FIELD_MODULUS = modulus
 	alias_count = max(2, alias_count)
-	raw_linear_terms_min = max(0, raw_linear_terms_min)
-	raw_linear_terms_max = max(raw_linear_terms_min, raw_linear_terms_max)
+	if free_x:
+		raw_linear_terms_min = max(0, raw_linear_terms_min)
+		raw_linear_terms_max = max(raw_linear_terms_min, raw_linear_terms_max)
+	else:
+		raw_linear_terms_min = 0
+		raw_linear_terms_max = 0
 	if other_constants_min is not None:
 		other_constants_min = max(0, other_constants_min)
 	if other_constants_max is not None:
@@ -1145,7 +1213,23 @@ def generate_formula(
 	inverse_min_appearances = max(1, inverse_min_appearances)
 	inverse_min_product_appearances = max(0, inverse_min_product_appearances)
 	extra_terms = max(0, extra_terms)
-	profile = COMPLEXITY_PRESETS.get(complexity, COMPLEXITY_PRESETS["medium"])
+	profile = resolve_complexity_profile(
+		complexity,
+		linear_part_min=linear_part_min,
+		linear_part_max=linear_part_max,
+		leaf_part_min=leaf_part_min,
+		leaf_part_max=leaf_part_max,
+		nested_linear_rate=nested_linear_rate,
+		nested_linear_scale_rate=nested_linear_scale_rate,
+		combo_scale_rate=combo_scale_rate,
+		compound_piece_rate=compound_piece_rate,
+		compound_piece_min=compound_piece_min,
+		compound_piece_max=compound_piece_max,
+		quadratic_depth=quadratic_depth,
+		core_depth=core_depth,
+		constant_atom_rate=constant_atom_rate,
+		extra_constant_rate=extra_constant_rate,
+	)
 	coefficient_rate = min(max(coefficient_rate, 0.0), 1.0)
 	direct_alias_product_rate = min(max(direct_alias_product_rate, 0.0), 1.0)
 	inverse_rate = min(max(inverse_rate, 0.0), 1.0)
@@ -1471,6 +1555,27 @@ def main() -> None:
 		help="Minimum number of multiplicative appearances for each generated inverse term when possible.",
 	)
 	parser.add_argument(
+		"--free_x",
+		dest="free_x",
+		action=argparse.BooleanOptionalAction,
+		default=True,
+		help="Allow or disallow raw helper terms containing bare x outside affine aliases.",
+	)
+	parser.add_argument("--linear-part-min", type=int, default=None, help="Override the minimum number of parts in non-leaf linear combinations.")
+	parser.add_argument("--linear-part-max", type=int, default=None, help="Override the maximum number of parts in non-leaf linear combinations.")
+	parser.add_argument("--leaf-part-min", type=int, default=None, help="Override the minimum number of parts in leaf-level linear combinations.")
+	parser.add_argument("--leaf-part-max", type=int, default=None, help="Override the maximum number of parts in leaf-level linear combinations.")
+	parser.add_argument("--nested-linear-rate", type=float, default=None, help="Override how often linear combinations recurse into nested combinations.")
+	parser.add_argument("--nested-linear-scale-rate", type=float, default=None, help="Override how often nested linear combinations receive an extra scalar wrapper.")
+	parser.add_argument("--combo-scale-rate", type=float, default=None, help="Override how often a completed linear combination receives an extra scalar wrapper.")
+	parser.add_argument("--compound-piece-rate", type=float, default=None, help="Override how often a quadratic piece expands into a compound sum or difference.")
+	parser.add_argument("--compound-piece-min", type=int, default=None, help="Override the minimum number of subpieces in a compound quadratic piece.")
+	parser.add_argument("--compound-piece-max", type=int, default=None, help="Override the maximum number of subpieces in a compound quadratic piece.")
+	parser.add_argument("--quadratic-depth", type=int, default=None, help="Override recursion depth for alias and extra quadratic-piece generation.")
+	parser.add_argument("--core-depth", type=int, default=None, help="Override recursion depth for the core expression builder.")
+	parser.add_argument("--constant-atom-rate", type=float, default=None, help="Override how often generated constants are chosen instead of affine/linear atoms.")
+	parser.add_argument("--extra-constant-rate", type=float, default=None, help="Override how often extra terms prefer constants before building quadratic pieces.")
+	parser.add_argument(
 		"--mult-inverse",
 		action="store_true",
 		help="Multiply the final visible right-hand side by inv(k(x)) for one existing affine term, while keeping the cleared-denominator polynomial form quadratic.",
@@ -1494,6 +1599,21 @@ def main() -> None:
 		inverse_min_appearances=args.inverse_min_appearances,
 		inverse_min_product_appearances=args.inverse_min_product_appearances,
 		mult_inverse=args.mult_inverse,
+		free_x=args.free_x,
+		linear_part_min=args.linear_part_min,
+		linear_part_max=args.linear_part_max,
+		leaf_part_min=args.leaf_part_min,
+		leaf_part_max=args.leaf_part_max,
+		nested_linear_rate=args.nested_linear_rate,
+		nested_linear_scale_rate=args.nested_linear_scale_rate,
+		combo_scale_rate=args.combo_scale_rate,
+		compound_piece_rate=args.compound_piece_rate,
+		compound_piece_min=args.compound_piece_min,
+		compound_piece_max=args.compound_piece_max,
+		quadratic_depth=args.quadratic_depth,
+		core_depth=args.core_depth,
+		constant_atom_rate=args.constant_atom_rate,
+		extra_constant_rate=args.extra_constant_rate,
 	)
 	assignment_lines, derived_affine_values, check_lines = evaluate_correctness(bundle, args.seed)
 

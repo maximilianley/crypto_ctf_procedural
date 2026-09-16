@@ -1,67 +1,170 @@
 import hashlib
 import os
+import random
 from Crypto.Util.number import bytes_to_long, getPrime, isPrime
 
-FLAG = b'FLAG{currywurst_32178}'
+FLAG = b'FLAG{currywurst_30797}'
+OTHER_CONSTANTS = ['v', 'w', 'y', 'z', 'aa']
+MESSAGES = ['Message 1: Give me the flag', 'Message 2: Give me the flag', 'Message 3: Give me the flag', 'Message 4: Give me the flag', 'Message 5: Give me the flag']
+
+FIELD_PRIME_BITS = 256
+
+def is_probable_prime(candidate, rng, rounds=16):
+    if candidate < 2:
+        return False
+    for small_prime in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31):
+        if candidate == small_prime:
+            return True
+        if candidate % small_prime == 0:
+            return False
+    d = candidate - 1
+    s = 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+    for _ in range(rounds):
+        a = rng.randrange(2, candidate - 1)
+        x = pow(a, d, candidate)
+        if x in (1, candidate - 1):
+            continue
+        for _ in range(s - 1):
+            x = pow(x, 2, candidate)
+            if x == candidate - 1:
+                break
+        else:
+            return False
+    return True
+
+def sample_prime_modulus(seed):
+    rng = random.Random(seed)
+    while True:
+        candidate = rng.getrandbits(FIELD_PRIME_BITS)
+        candidate |= 1 << (FIELD_PRIME_BITS - 1)
+        candidate |= 1
+        if is_probable_prime(candidate, rng):
+            return candidate
+
+def sample_prime_order_group(q, rng):
+    while True:
+        k = rng.getrandbits(768)
+        k |= 1 << 767
+        if k % 2 != 0:
+            k += 1
+        p = k * q + 1
+        if isPrime(p):
+            break
+    h = 2
+    while True:
+        g = pow(h, (p - 1) // q, p)
+        if g > 1:
+            return p, g
+        h += 1
+
+def sample_nonzero_mod_q(rng, q):
+    while True:
+        value = rng.randrange(1, q)
+        if value != 0:
+            return value
 
 class WeakDSAServer:
     def __init__(self):
         # Standard DSA group parameters
-        self.q = 64929821218089736052093329003565926393393639381610099597349948188223645053909
-        self.p = 87062437936393389468020945769077374486606105621754883410521322358565472128681733286237926941354039495746857227435989995857076314840252624218590371621114128510622288253980963200949174036469570719727982168947024123079042920155157547109298966043792571977737601733331233328369950223999420083018300151344726320593
-        self.g = 18573925846744227613332473269237840984420131590429948802557287034672454300508541987018824933528239717190104640200567179664427777135642652187758901280976867615224975432003154799334684830804493454357898076788986137783017219158451736436562667130618150393934478482577741796954911155392594163329856235432933483754
+        runtime_rng = random.Random(os.urandom(96))
+        self.group_q = sample_prime_modulus(os.urandom(96))
+        self.group_p, self.generator_g = sample_prime_order_group(self.group_q, runtime_rng)
 
         # Private key x, Public key y
-        self.x = bytes_to_long(FLAG)
-        self.y = 42732044744277739069115553859570241368351589280507049166315366229575896177482009331018094015787695088165613094138688068755050510807324868836723535639215310775716470625725898390999119228709909893250088907578640440482069084202317065240605755185238991865336615684283006164164696571988754581559672511615833206363
+        self.private_x = bytes_to_long(FLAG)
+        self.public_y = pow(self.generator_g, self.private_x, self.group_p)
 
         # Generated state terms
-        self.u = 10156189836282572441013015518740647516929616017316117914849080887826367200904
+        self.state_u = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.state_f = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.state_g = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.state_h = sample_nonzero_mod_q(runtime_rng, self.group_q)
 
         # Other constants
-        self.e = 7032480303382669816850983107266071201810896148313947340206409980318655632542
-        self.i = 49616755265483364897624838225365254442680241556378574287538040609753735651428
+        self.const_v = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.const_w = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.const_y = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.const_z = sample_nonzero_mod_q(runtime_rng, self.group_q)
+        self.const_aa = sample_nonzero_mod_q(runtime_rng, self.group_q)
 
         self.current_k = 0
 
     def get_next_nonce(self):
-        """Vulnerable Nonce Generator using a generated recurrence."""
-        self.current_k = (((self.i) - ((self.u)*((self.u - self.u - self.u)) + (self.i)*(-self.e)))*pow(self.u, -1, self.q)) % self.q
-        self.u = self.current_k
+        self.current_k = (((((self.state_g + self.state_f + self.state_u - self.const_w*(((self.state_h - self.state_u) - self.state_u - self.state_g)) - self.state_u) + ((self.state_u - self.const_w*((-self.const_y + self.state_u + self.const_aa)) + (self.state_g - self.state_f - self.const_v) + self.state_h))**2 - (((self.state_f + self.state_u - self.const_aa) - (self.state_g + self.state_g - self.state_g - -self.const_y) + self.const_w*((self.state_u - self.state_f + self.state_u - self.state_g)) - self.const_aa*((self.state_g - self.const_w))))*((self.const_w*((self.state_f - -self.const_z - self.state_h + self.state_f)) - (-self.const_z + self.state_h - self.state_u) - self.state_f - self.state_g + self.const_z*((self.const_v + -self.const_y + self.state_f)))) + (((self.const_w + self.state_f + self.state_h - self.state_h) - self.state_h - self.const_y*((self.state_h - self.state_g + -self.const_y - self.state_g)) - (self.state_h - self.state_g + self.state_f - self.state_u)))**2) + self.const_w*(((((self.state_u + self.state_u) + self.state_u - (self.state_h + self.state_h) + self.state_g) - (self.state_g - (self.state_h - self.const_v + self.const_aa + self.state_g) + self.state_g) - self.state_f) - ((self.state_g - self.state_h + self.const_v*((-self.const_z - self.const_aa + self.state_g + self.state_f))))*((self.state_u + self.const_aa*((self.const_w + self.const_w)) - self.state_u - self.state_g - -self.const_z)) - (((-self.const_y - self.state_g) + (self.state_f - self.state_f) - self.state_u))**2 - ((self.const_y*((self.state_h + self.state_f - self.state_h)) - (self.state_g + self.state_u) - self.state_u))**2)) + (self.state_g)*(pow(self.const_w, -1, self.group_q)) + (self.state_g)*(pow(self.const_w, -1, self.group_q)) + (self.state_f)*(pow(self.const_y, -1, self.group_q)) + (self.const_w)*(pow(self.const_y, -1, self.group_q)) + (pow(self.const_z, -1, self.group_q))*(self.state_g) + (pow(self.const_z, -1, self.group_q))*(self.state_g)) - ((self.state_u)*((self.state_f + self.state_h - self.state_u + self.state_u)) + self.const_aa*((((self.state_g + self.state_f + self.state_f))**2 - ((self.const_v + self.state_g - self.const_v*((self.const_v + self.state_f - self.state_g)) + self.state_u + self.state_u))*(self.const_v*((self.state_u + self.state_g + self.state_u - self.state_u))) - ((self.state_g + -self.const_y + self.state_g + (self.state_f + self.const_w) + self.state_h))*((self.state_u - self.state_h + self.const_w*((self.state_g + self.state_h - self.state_h + self.state_u)))) - (self.const_z*((self.state_h + self.state_u - self.const_v)))*((self.state_g + self.const_aa*((self.state_h - self.state_u + self.state_h + self.state_h)) + self.const_w*((self.state_u + self.state_g + self.const_v - -self.const_y)) - self.state_u)))) + self.const_y*((self.state_u - self.state_h + -self.const_y + self.state_u)) - self.const_z + ((self.state_u - self.const_w - self.state_g + self.const_z*((self.state_g + self.state_g - self.const_z*((self.state_u + self.state_u + self.state_h)) - self.state_u))))**2 + self.const_z*(self.const_z*(((self.state_u - self.const_v - self.state_u) - self.const_v*((self.state_u - self.const_aa - self.state_f - self.const_aa*((self.state_f + self.state_u + self.state_h + self.state_u)) + (-self.const_y - self.state_g - self.state_g + self.state_g))) + self.state_g - self.state_g))) + (self.const_aa)*(pow(self.const_w, -1, self.group_q)) + (pow(self.const_w, -1, self.group_q))*(-self.const_z) + (-self.const_z)*(pow(self.const_w, -1, self.group_q)) + (self.const_v)*(pow(self.const_w, -1, self.group_q)) + (self.const_v)*(pow(self.const_y, -1, self.group_q)) + (pow(self.const_y, -1, self.group_q))*(self.const_v) + (self.state_g)*(pow(self.const_y, -1, self.group_q)) + (self.const_v)*(pow(self.const_y, -1, self.group_q)) + (self.const_aa)*(pow(self.const_z, -1, self.group_q)) + (self.state_u)*(pow(self.const_z, -1, self.group_q)) + (self.state_u)*(pow(self.const_z, -1, self.group_q)) + (pow(self.const_z, -1, self.group_q))*(self.state_u)))*pow(self.state_f, -1, self.group_q)) % self.group_q
+        self.state_u = self.state_f
+        self.state_f = self.state_g
+        self.state_g = self.state_h
+        self.state_h = self.current_k
         return self.current_k
 
     def sign(self, message: bytes):
-        h = bytes_to_long(hashlib.sha256(message).digest()) % self.q
+        h = bytes_to_long(hashlib.sha256(message).digest()) % self.group_q
         k = self.get_next_nonce()
 
-        r = pow(self.g, k, self.p) % self.q
-        k_inv = pow(k, -1, self.q)
-        s = (k_inv * (h + self.x * r)) % self.q
+        r = pow(self.generator_g, k, self.group_p) % self.group_q
+        k_inv = pow(k, -1, self.group_q)
+        s = (k_inv * (h + self.private_x * r)) % self.group_q
         return (r, s)
 
 
-def main():
+def export_public_challenge():
     server = WeakDSAServer()
+    signatures = []
+    for message in MESSAGES:
+        signatures.append(server.sign(message.encode()))
+    return {
+        'p': server.group_p,
+        'q': server.group_q,
+        'g': server.generator_g,
+        'y': server.public_y,
+        'messages': list(MESSAGES),
+        'signatures': signatures,
+        'constants': {'v': server.const_v, 'w': server.const_w, 'y': server.const_y, 'z': server.const_z, 'aa': server.const_aa},
+    }
+
+def main():
+    challenge = export_public_challenge()
     print("=== Vulnerable DSA Signing Service ===")
-    print(f"p = {server.p}")
-    print(f"q = {server.q}")
-    print(f"g = {server.g}")
-    print(f"y = {server.y}")
+    print(f"p = {challenge['p']}")
+    print(f"q = {challenge['q']}")
+    print(f"g = {challenge['g']}")
+    print(f"y = {challenge['y']}")
     print()
     print("Other constants:")
-    print(f"  e = {server.e}")
-    print(f"  i = {server.i}")
+    print(f"  v = {challenge['constants']['v']}")
+    print(f"  w = {challenge['constants']['w']}")
+    print(f"  y = {challenge['constants']['y']}")
+    print(f"  z = {challenge['constants']['z']}")
+    print(f"  aa = {challenge['constants']['aa']}")
     print()
-    msg1 = b"Message 1: Give me the flag"
-    msg2 = b"Message 2: Give me the flag"
-    r1, s1 = server.sign(msg1)
-    r2, s2 = server.sign(msg2)
+    msg1 = challenge['messages'][0].encode()
+    msg2 = challenge['messages'][1].encode()
+    msg3 = challenge['messages'][2].encode()
+    msg4 = challenge['messages'][3].encode()
+    msg5 = challenge['messages'][4].encode()
+    r1, s1 = challenge['signatures'][0]
+    r2, s2 = challenge['signatures'][1]
+    r3, s3 = challenge['signatures'][2]
+    r4, s4 = challenge['signatures'][3]
+    r5, s5 = challenge['signatures'][4]
     print(f"Msg 1: {msg1.decode()}")
     print(f"r1 = {r1}")
     print(f"s1 = {s1}\n")
     print(f"Msg 2: {msg2.decode()}")
     print(f"r2 = {r2}")
     print(f"s2 = {s2}\n")
+    print(f"Msg 3: {msg3.decode()}")
+    print(f"r3 = {r3}")
+    print(f"s3 = {s3}\n")
+    print(f"Msg 4: {msg4.decode()}")
+    print(f"r4 = {r4}")
+    print(f"s4 = {s4}\n")
+    print(f"Msg 5: {msg5.decode()}")
+    print(f"r5 = {r5}")
+    print(f"s5 = {s5}\n")
 
 if __name__ == "__main__":
     main()
